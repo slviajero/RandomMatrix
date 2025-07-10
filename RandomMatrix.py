@@ -360,7 +360,7 @@ class MatrixInverseDistance(Matrix):
             size = self.N
         if param2 < 0:
             raise ValueError("Degrees of freedom must be greater than 2 for Student's t-distribution. Set param2 to a value greater than 0.")
-        student_t = param2 + 2.01  # ensure degrees of freedom is greater than 2
+        student_t = param2 + 3  # ensure degrees of freedom is greater than 2
         if self.solver == 'cupy':
             self.coords = cp.random.standard_t(student_t, size=(size, self.space_dimension)) / cp.sqrt(student_t / (student_t - 2)) * param1
         else:
