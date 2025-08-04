@@ -51,13 +51,28 @@ class Matrix:
         self.eigenvalue_median = None
         self.row_max = None
         self.row_min = None
+        self.rowssum = None
         self.eigenvectorsigns = None
         self.zerodiag = True
         self.projections = None
+        self.localization_index = None
         self.confcount = 0
         self.nearest_neighbor = None
         self.nearest_neighbor_total = 0.0
         self.maximum_distance = 0.0
+        self.length_scale = 1.0 # remember the length scale we processed
+        self.element_average_predicted = None
+        self.element_average2_predicted = None
+        self.element_mode_predicted = None
+        self.element_veff_predicted = None
+        self.hardcore_count = 0
+        self.hardcore=0
+        self.logarithmic=False
+        self.logscale=1
+        self.exponent=0
+        self.localization_exponent = 2.0
+        self.distribution = "generic"
+        self.correlated = False
 
         # determine the solver to use
         if solver == 'auto':
@@ -80,11 +95,11 @@ class Matrix:
         if self.solver == 'numpy':
             self.matrix = np.zeros((self.N, self.N))
             self.projections = np.zeros(self.N)
-            self.projection_vector = np.ones(self.N)
+            self.projection_vector = np.ones(self.N) # / np.sqrt(self.N)
         elif self.solver == 'cupy':
             self.matrix = cp.zeros((self.N, self.N))
             self.projections = cp.zeros(self.N)
-            self.projection_vector = cp.ones(self.N)
+            self.projection_vector = cp.ones(self.N) # / cp.sqrt(self.N)
         elif self.solver == 'jax':
             print("Warning: jax is not fully supported. Using numpy.")
             self.solver = 'numpy'
@@ -98,37 +113,59 @@ class Matrix:
         self.setup(param1, param2)
         self.eigenvectorsigns = []
         self.projections = []
+        self.localization_index = []
+        self.element_covariance = 0.0
         if self.solver == 'cupy':
+            # element properties
             self.element_sum = cp.asnumpy(cp.sum(self.matrix))
             self.element_sumsquare = cp.asnumpy(cp.sum(cp.square(self.matrix)))
-            rowssum = cp.sum(self.matrix, axis=1)
+            # the rowsum
+            self.rowssum = cp.asnumpy(cp.sum(self.matrix, axis=1))
+            self.row_max = cp.asnumpy(cp.max(self.rowssum))
+            self.row_min = cp.asnumpy(cp.min(self.rowssum))
+            # the maximum elements per line and the nearest neighbor
             nearest = cp.max(self.matrix, axis=1)
             self.nearest_neighbor_total = cp.asnumpy(1 / cp.max(self.matrix))
-            self.row_max = cp.asnumpy(cp.max(rowssum))
-            self.row_min = cp.asnumpy(cp.min(rowssum))
             self.nearest_neighbor = cp.asnumpy(cp.mean(1 / nearest))
+            # diagonalize
             self.eigenvalues, self.eigenvectors = cp.linalg.eigh(self.matrix)
-            projections = cp.asnumpy(cp.dot(self.eigenvectors.T, self.projection_vector))
+            #project to a fixed vector
+            projections_cp = cp.dot(self.eigenvectors.T, self.projection_vector)
+            projections = cp.asnumpy(projections_cp)
+            # localization index and signs 
+            localization_index = cp.asnumpy(cp.sum(cp.pow(self.eigenvectors, 2 * self.localization_exponent), axis=0))
             signs = cp.asnumpy(cp.mean(cp.sign(self.eigenvectors), axis=0)) * self.N
+            # store the results
             self.projections.extend(projections.tolist())
             self.eigenvectorsigns.extend(signs.tolist())
+            self.localization_index.extend(localization_index.tolist())
+            #convert the eigenvectors and eigenvalues to numpy arrays
             self.eigenvectors = cp.asnumpy(self.eigenvectors)
             self.eigenvalues = cp.asnumpy(self.eigenvalues)
+            self.element_covariance = cp.asnumpy(self.element_covariance)
         else:
+            # element properties
             self.element_sum = np.sum(self.matrix)
             self.element_sumsquare = np.sum(np.square(self.matrix))
-            rowsum = np.sum(self.matrix, axis=1)
+            # the rowsum
+            self.rowsum = np.sum(self.matrix, axis=1)
+            self.row_max = np.max(self.rowsum)
+            self.row_min = np.min(self.rowsum)
+            # the maximum elements per line and the nearest neighbor
             nearest = np.max(self.matrix, axis=1)
-            self.row_max = np.max(rowsum)
-            self.row_min = np.min(rowsum)
             self.nearest_neighbor_total = 1 / np.max(self.matrix)
             self.nearest_neighbor = np.mean(1 / nearest)
+            # diagonalize
             self.eigenvalues, self.eigenvectors = eigh(self.matrix, overwrite_a=True)
+            # project to a fixed vector
             projections = np.dot(self.eigenvectors.T, self.projection_vector)
+            # localization index and signs
+            localization_index = np.sum(np.pow(self.eigenvectors, 2 * self.localization_exponent), axis=0)
             signs = np.mean(np.sign(self.eigenvectors), axis=0) * self.N
+            # store the results
             self.projections.extend(projections.tolist())
             self.eigenvectorsigns.extend(signs.tolist())
-
+            self.localization_index.extend(localization_index.tolist())
         self.confcount += 1
 
 # Uncorrelated matrices with the same distributions as the distance matrices
@@ -178,6 +215,7 @@ class MatrixUncorrelated(Matrix):
 class MatrixGaussian(Matrix):
     def setup(self, param1=1.0, param2=0.0):
         self.zerodiag = True
+        self.length_scale = param1
         # Fill upper triangle (excluding diagonal) with random values, then symmetrize and zero diagonal
         upper_indices = np.triu_indices(self.N, k=1)
         values = np.random.normal(param2, param1, size=len(upper_indices[0]))
@@ -185,9 +223,22 @@ class MatrixGaussian(Matrix):
         self.matrix[(upper_indices[1], upper_indices[0])] = values  # Symmetrize
         np.fill_diagonal(self.matrix, 0)
 
+class MatrixGOE(Matrix):
+    def setup(self, param1=1.0, param2=0.0):
+        self.zerodiag = False
+        self.length_scale = param1
+        # Fill upper triangle (excluding diagonal) with random values, then symmetrize and zero diagonal
+        upper_indices = np.triu_indices(self.N, k=1)
+        values = np.random.normal(param2, param1, size=len(upper_indices[0]))
+        self.matrix[upper_indices] = values
+        self.matrix[(upper_indices[1], upper_indices[0])] = values  # Symmetrize
+        np.fill_diagonal(self.matrix, np.random.normal(param2, param1 * 2, size=self.N))  # Set diagonal to random values
+
+
 # Symmetric uniform matrix
 class MatrixUniform(Matrix):
     def setup(self, param1=1.0, param2=0.0):
+        self.length_scale = param1
         lower_bound = param2 - param1/2
         upper_bound = param2 + param1/2
         self.zerodiag = True
@@ -201,10 +252,46 @@ class MatrixUniform(Matrix):
 # to test average and variance of the matrix elements
 class MatrixUnity(Matrix):
     def setup(self, param1=1.0, param2=0.0):
-        self.matrix = np.ones((self.N, self.N))
+        self.length_scale = param1
+        self.matrix = np.ones((self.N, self.N)) * param1
         self.zerodiag = True
         np.fill_diagonal(self.matrix, 0)
   
+# to test average and variance of the matrix elements
+class MatrixUnityNoise(Matrix):
+    def __init__(self, N, noised=1, noise_type='no_vertex', background=0.0):
+        super().__init__(N)
+        self.noised=noised
+        self.noise_type=noise_type
+        self.background = background
+    def setup(self, param1=1.0, param2=0.0):
+        self.length_scale = param1
+        self.matrix = np.ones((self.N, self.N)) * param1 
+        if self.noised  > self.N // 2 and self.noise_type == 'no_vertex':
+            raise ValueError("Number of noised vertices must be less than half of the total number of vertices.")
+        if self.noised  >= self.N and self.noise_type == 'vertex':
+            raise ValueError("Number of noised vertices must be less than the total number of vertices.")
+        if self.background != 0.0:
+            self.matrix += np.random.uniform(-self.background, self.background, size=(self.N, self.N))
+        self.zerodiag = True
+        np.fill_diagonal(self.matrix, 0)
+        if self.noise_type == 'no_vertex':
+            for i in range(self.noised):
+                lower_bound = -param2/2
+                if lower_bound < 0:
+                    lower_bound = 0
+                upper_bound=param2/2
+                noise = np.random.uniform(lower_bound, upper_bound)
+                self.matrix[2*i,2*i+1]+=noise
+                self.matrix[2*i+1,2*i]+=noise
+        else:
+            for i in range(self.noised):
+                noise = np.random.uniform(0, param2)
+                self.matrix[i,i+1]+=noise
+                self.matrix[i+1,i]+=noise
+
+
+
 # Samples (inverse) distances for various distributions in a 
 # space of dimension dimension. Mostly used and tested right 
 # now for 3D. 
@@ -258,6 +345,7 @@ class MatrixInverseDistance(Matrix):
         self.correlated = correlated
         self.cutoff = 1 / self.hardcore # only for exponent -1 
 
+        # say who we are 
         print("MatrixInverseDistance initialized with parameters:"
               "\nN: {}, scaled: {}, distribution: {}, hardcore: {}, "
               "solver: {}, correlated: {}, exponent: {}, logarithmic: {}, "
@@ -269,9 +357,36 @@ class MatrixInverseDistance(Matrix):
         if self.space_dimension < 2:
             raise ValueError("Distribution not supported for space dimension {}: {}".format(self.space_dimension, self.distribution))
 
-        # hope the best
-        #if not self.correlated:
-        #    raise ValueError("Uncorrelated matrices not yet supported. Use class MatrixUncorrelated instead.")
+        # generate predicted values in units of self.length_scale
+        # the element average i.e. first moment of g
+        # the square element average, i.e. the second moment of g
+        # the mode of the distribution of g
+        # the effective volume, i.e. the prefactor of the tail of P(g)
+        if self.distribution == 'normal':
+            self.element_average_predicted = 1 / np.sqrt( np.pi )
+            self.element_average2_predicted = 1 / 2
+            self.element_mode_predicted = 1 / np.sqrt(8)
+            self.element_veff_predicted = 1 / ( 2 * np.sqrt( np.pi )) / ( 4 * np.pi )
+        elif self.distribution == 'uniform':
+            self.element_average_predicted = 6 / 5
+            self.element_average2_predicted = 9 / 4
+            self.element_mode_predicted = 1 / ( np.sqrt(39 / 7) - 1 )
+            self.element_veff_predicted = 3 / ( 4 * np.pi )
+        elif self.distribution == 'cube':
+            self.element_average_predicted = None
+            self.element_average2_predicted = None
+            self.element_mode_predicted = None
+            self.element_veff_predicted = 1 / 8
+        elif self.distribution == 'student_t':
+            self.element_average_predicted = None
+            self.element_average2_predicted = None
+            self.element_mode_predicted = None
+            self.element_veff_predicted = None
+        else:
+            self.element_average_predicted = None
+            self.element_average2_predicted = None
+            self.element_mode_predicted = None
+            self.element_veff_predicted = None
 
     # generate a set of coordinates samples from the specified distribution
     def configuration(self, param1=1.0, param2=0.0, size=None):
@@ -431,6 +546,9 @@ class MatrixInverseDistance(Matrix):
         # scale the stadard deviation with n^(1/3)
         if self.scaled:
             param1 = param1 * (self.N/4.0)**(1.0/self.space_dimension)
+        
+        # depends on our scaleing
+        self.length_scale = param1
 
         # do we sample correlated matrices? In this case 
         # we need N coordinate vectors in a dimension space.
@@ -441,7 +559,6 @@ class MatrixInverseDistance(Matrix):
             coord_size = self.N
         else:
             coord_size = self.N * (self.N - 1)
-
 
         small_distances = []  # to store small distances for checking the matrix validity
         while True:
@@ -480,7 +597,8 @@ class MatrixInverseDistance(Matrix):
                     small_distances = cp.asarray(distances[distances > 0])
                     small_distances = small_distances[small_distances < self.hardcore]
                     if len(small_distances) == 0:
-                        with cp.errstate(over='ignore', divide='ignore', invalid='ignore'):
+                        # with cp.errstate(over='ignore', divide='ignore', invalid='ignore'):
+                        if True: # cupy error handling is not yet implemented
                             if self.logarithmic:
                                 self.matrix = - cp.log(distances*self.logscale)
                             else:
@@ -574,6 +692,7 @@ class Simulation:
         self.element_sum_list = None
         self.element_sumsquare_list = None
         self.projections = None
+        self.localization_index = None
         self.element_average = 0.0
         self.element_variance = 0.0
         self.eigenvalue_median = 0.0
@@ -591,6 +710,12 @@ class Simulation:
         # signs and nearest neighbour analysis
         self.eigenvectorsigns = None
         self.nearest_neighbor = None
+        # derived predicted values
+        self.element_variance_predicted = None
+        self.rowsum = None
+        # the row sum statistics
+        self.row_sum_variance = 0.0
+        self.one_vertex_covariance = 0.0
 
     def random_seed(self, seed):
         # set the random seed for reproducibility
@@ -602,6 +727,8 @@ class Simulation:
     def sample(self, samples=1000, param1=1.0, param2=0.0):
         self.eigenvalues = []
         self.projections = []
+        self.localization_index = []
+        self.rowsum = []
         self.element_sum_list = []
         self.element_sumsquare_list = []
         self.zeroconf = []
@@ -616,7 +743,7 @@ class Simulation:
         self.zeroconfprojections = []
         self.samples = samples
         self.param1 = param1
-        self.param2 = param2    
+        self.param2 = param2 
  
         for _ in range(samples):
             self.Matrix.sample(param1, param2)
@@ -630,6 +757,7 @@ class Simulation:
             # in ascending order, so the biggest eigenvalue is the last one
             # and the rest are the first N-2 ones
             self.projections.extend(self.Matrix.projections)
+            self.localization_index.extend(self.Matrix.localization_index)
             # store the zero configuration
             if self.storezeroconf and (np.min(np.abs(self.Matrix.eigenvalues)) < self.zeroconfthreshold):    
                 self.zeroconfeigenvalues.append(np.array(self.Matrix.eigenvalues))
@@ -640,24 +768,38 @@ class Simulation:
             self.nearest_neighbor.append(self.Matrix.nearest_neighbor)
             # the total nearest neighbor distance, i.e. the smallest distance in the matrix
             self.nearest_neighbor_total.append(self.Matrix.nearest_neighbor_total)
- 
+            self.rowsum.append(self.Matrix.rowsum)
+
         #the element pproperties: average and variance with N-1 corrections
         if self.Matrix.zerodiag:
             self.element_average = np.sum(self.element_sum_list) / (self.Matrix.N * (self.Matrix.N - 1)) / samples
-            self.element_variance = np.sum(self.element_sumsquare_list) / samples / (self.Matrix.N * (self.Matrix.N - 1)) - self.element_average**2
+            self.element_sumsquare = np.sum(self.element_sumsquare_list) / samples / (self.Matrix.N * (self.Matrix.N - 1))
+            self.element_variance = self.element_sumsquare - self.element_average**2
         else:   
             self.element_average = np.sum(self.element_sum_list) / (self.Matrix.N * self.Matrix.N) /samples
-            self.element_variance = np.sum(self.element_sumsquare_list) / samples / (self.Matrix.N * self.Matrix.N) - self.element_average**2
+            self.element_sumsquare = np.sum(self.element_sumsquare_list) / samples / (self.Matrix.N * self.Matrix.N)
+            self.element_variance = self.element_sumsquare - self.element_average**2
+
+        # quantities that are derived from the predicted values
+        if self.Matrix.element_average_predicted is not None:
+            self.element_variance_predicted = self.Matrix.element_average2_predicted - self.Matrix.element_average_predicted ** 2 
+            self.element_variance_predicted = self.element_variance_predicted * self.Matrix.length_scale
+        
+        if self.Matrix.element_veff_predicted is not None:
+            #                                 gamma(4/3) * (3/(4 pi))^(1/3)
+            self.nearest_neighbor_predicted = 0.89 * 0.623 / np.pow(self.Matrix.element_veff_predicted * self.Matrix.N, 1/3)
 
         # element properties
         self.inverse_element_average = 1 / self.element_average
         # various qauntities of the row sums
-        self.row_sum_maximum = np.max(self.row_max)
-        self.row_sum_maximum_std = np.std(self.row_max) 
-        self.row_sum_minimum = np.min(self.row_min)
-        self.row_sum_minimum_std = np.std(self.row_min)
-        self.row_sum_average = self.element_average * ( self.Matrix.N - 1 )
-        self.row_sum_average_std = np.sqrt((self.Matrix.N - 1)* self.element_variance)
+        self.rowsum_maximum = np.max(self.row_max)
+        self.rowsum_maximum_std = np.std(self.row_max) 
+        self.rowsum_minimum = np.min(self.row_min)
+        self.rowsum_minimum_std = np.std(self.row_min)
+        self.rowsum_average = np.mean(self.rowsum)
+        self.rowsum_average_std = np.std(self.rowsum)
+        self.rowsum_variance = np.var(self.rowsum)
+        self.one_vertex_covariance = (self.rowsum_variance - (self.Matrix.N - 1) * self.element_variance ) / (self.Matrix.N - 2) / (self.Matrix.N - 1)
         # nearest neighbor code is only for inverse and has to be reworked
         self.nearest_neighbor_average = np.mean(self.nearest_neighbor)
         self.nearest_neighbor_std = np.std(self.nearest_neighbor)
@@ -673,17 +815,40 @@ class Simulation:
         # as they are already sorted in the Matrix class
         self.eigenvalues = np.array(self.eigenvalues).reshape(-1, self.Matrix.N)
         self.projections = np.array(self.projections).reshape(-1, self.Matrix.N)
+        self.rowsum = np.array(self.rowsum).reshape(-1, self.Matrix.N)
+        self.localization_index = np.array(self.localization_index).reshape(-1, self.Matrix.N)
         # Count the number of positive eigenvalues for each configuration
         self.positive = np.sum(self.eigenvalues > 0, axis=1)
         self.negative = np.sum(self.eigenvalues < 0, axis=1)
         self.zero = np.sum(self.eigenvalues == 0, axis=1) # should never happen
-        # averages of the eigenvalues 
+        # averages of the eigenvalues
         self.eigenvalues_averages = np.mean(self.eigenvalues, axis=0)
         self.eigenvalues_median = np.median(self.eigenvalues, axis=0) 
         self.eigenvalues_standard_deviation = np.std(self.eigenvalues, axis=0)
+        # averages of the projections
+        self.projections_average = np.mean(self.projections, axis=0)
+        self.projections_standard_deviation = np.std(self.projections, axis=0)
 
+
+    """ This is a set of trivial methods that help to access the 
+        data without using the internal variables of the class. 
+        They are not necessary for the functionality of the class,
+        but they make the code more readable and easier to use.
+    """
+
+    def bulk(self):
+        return self.eigenvalues[:-1]
+
+    def perron(self):
+        return self.eigenvalues[-1]
+    
+    def diffs(self):
+        return np.diff(self.eigenvalues, axis=1)
+    
+
+    """ General print method that prints the results of the simulation.
+    """
     def print_results(self, file=sys.stdout):
-
         print("--------------------- Simulation --------------------------")
         print("Sampled matrices:", self.samples, "from", self.Matrix.__class__.__name__, file=file)
         print("  Dimension:", self.Matrix.N, "Distribution:", self.Matrix.distribution, "Correlated:", self.Matrix.correlated, file=file)
@@ -693,15 +858,35 @@ class Simulation:
         print("----------------------- Results ----------------------------")
         print("Matrix element average:", 
             self.element_average, "std:", np.sqrt(self.element_variance), file=file)
+        if self.Matrix.element_average_predicted is not None:
+            print("Predicted element average:",
+                self.Matrix.element_average_predicted / self.Matrix.length_scale, 
+                "std:", np.sqrt(self.element_variance_predicted) / self.Matrix.length_scale, file=file)
+        print("Matrix element^2 average:",
+                self.element_sumsquare)
+        if self.Matrix.element_average2_predicted is not None:
+            print("Predicted element^2 average:", 
+                self.Matrix.element_average2_predicted / ( self.Matrix.length_scale ** 2 ), file=file)
+        if self.Matrix.element_mode_predicted is not None:
+            print("Predicted element mode:", 
+                self.Matrix.element_mode_predicted / self.Matrix.length_scale, file=file)
+        if self.Matrix.element_veff_predicted is not None:
+            print("Predicted inverse effective volume:", 
+                self.Matrix.element_veff_predicted / ( self.Matrix.length_scale ** 3 ), file=file)
         print("Inverse of element average:", 1 / self.element_average, file=file)
         print("Average maximum row sum:", 
-            self.row_sum_maximum, "std:", self.row_sum_maximum_std, file=file)
+            self.rowsum_maximum, "std:", self.rowsum_maximum_std, file=file)
         print("Average row sum:", 
-              self.row_sum_average, "std:", self.row_sum_average_std, file=file)
+              self.rowsum_average, "std:", self.rowsum_average_std, file=file)
         print("Average minimum row sum:", 
-            self.row_sum_minimum, "std:", self.row_sum_minimum_std, file=file)
+            self.rowsum_minimum, "std:", self.rowsum_minimum_std, file=file)
+        print("Row sum variance:", self.rowsum_variance, file=file)
+        print("One vertex covariance:", self.one_vertex_covariance, file=file)
         print("Average nearest neighbor distance:", 
             self.nearest_neighbor_average, "std:", self.nearest_neighbor_std, file=file)
+        if self.Matrix.element_veff_predicted is not None:    
+            print("Prediction nearest neighbor distance:",
+                self.nearest_neighbor_predicted)
         print("Inverse of average nearest neighbor distance:", 1 / self.nearest_neighbor_average, file=file)
         print("Average of inverse nearest neighbor distance:", 
             self.nearest_neighbor_inverse_average, "std:", self.nearest_neighbor_inverse_std, file=file)
