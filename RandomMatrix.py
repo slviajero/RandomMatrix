@@ -120,9 +120,9 @@ class Matrix:
             self.element_sum = cp.asnumpy(cp.sum(self.matrix))
             self.element_sumsquare = cp.asnumpy(cp.sum(cp.square(self.matrix)))
             # the rowsum
-            self.rowssum = cp.asnumpy(cp.sum(self.matrix, axis=1))
-            self.row_max = cp.asnumpy(cp.max(self.rowssum))
-            self.row_min = cp.asnumpy(cp.min(self.rowssum))
+            self.rowsum = cp.asnumpy(cp.sum(self.matrix, axis=1))
+            self.row_max = cp.asnumpy(cp.max(self.rowsum))
+            self.row_min = cp.asnumpy(cp.min(self.rowsum))
             # the maximum elements per line and the nearest neighbor
             nearest = cp.max(self.matrix, axis=1)
             self.nearest_neighbor_total = cp.asnumpy(1 / cp.max(self.matrix))
@@ -133,7 +133,7 @@ class Matrix:
             projections_cp = cp.dot(self.eigenvectors.T, self.projection_vector)
             projections = cp.asnumpy(projections_cp)
             # localization index and signs 
-            localization_index = cp.asnumpy(cp.sum(cp.pow(self.eigenvectors, 2 * self.localization_exponent), axis=0))
+            localization_index = cp.asnumpy(cp.sum(cp.power(self.eigenvectors, 2 * self.localization_exponent), axis=0))
             signs = cp.asnumpy(cp.mean(cp.sign(self.eigenvectors), axis=0)) * self.N
             # store the results
             self.projections.extend(projections.tolist())
